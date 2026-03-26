@@ -32,6 +32,7 @@ import json
 import time
 import warnings
 from pathlib import Path
+from datetime import datetime
 
 import numpy as np
 import pandas as pd
@@ -40,6 +41,7 @@ import torch.nn.functional as F
 from sklearn.decomposition import FastICA
 
 from fusion_resnet import FusionResNet, FusionResNetLite
+from anomaly_detector import AnomalyDetector
 
 warnings.filterwarnings('ignore')
 
@@ -86,6 +88,12 @@ def parse_args():
                              'If not provided, ICA is re-fitted from training data.')
     parser.add_argument('--top-k', type=int, default=None,
                         help='Only show top-k most confident appliances per window')
+    parser.add_argument('--enable-anomaly-detection', action='store_true',
+                        help='Enable fault detection and anomaly monitoring')
+    parser.add_argument('--anomaly-history', type=str, default=None,
+                        help='Path to save/load anomaly detection history')
+    parser.add_argument('--measured-current', type=float, default=None,
+                        help='Measured total RMS current (from PZEM or sensor) for anomaly detection')
     return parser.parse_args()
 
 
@@ -398,11 +406,13 @@ def load_input(input_path: str, pre_segmented: bool = False,
 def format_results(predictions: np.ndarray, probabilities: np.ndarray,
                    timestamps: np.ndarray | None,
                    appliance_names: list[str],
+                   anomaly_detector: AnomalyDetector | None = None,
+                   measured_current: float | None = None,
                    top_k: int = None) -> list[dict]:
     """Format predictions into human-readable results.
 
     Returns:
-        List of dicts, one per window, with active appliances and confidences.
+        List of dicts, one per window, with active appliances, confidences, and anomalies.
     """
     results = []
 
@@ -430,6 +440,20 @@ def format_results(predictions: np.ndarray, probabilities: np.ndarray,
 
         if timestamps is not None:
             entry['time_start_s'] = float(timestamps[i])
+            window_time = datetime.fromtimestamp(timestamps[i])
+        else:
+            window_time = None
+
+        # Check for anomalies
+        if anomaly_detector is not None:
+            anomalies = anomaly_detector.check_window(
+                predictions=predictions[i],
+                probabilities=probabilities[i],
+                measured_current=measured_current,
+                timestamp=window_time,
+            )
+            if anomalies:
+                entry['anomalies'] = [a.to_dict() for a in anomalies]
 
         results.append(entry)
 
@@ -477,6 +501,23 @@ def print_results_summary(results: list[dict], appliance_names: list[str],
         if not appliances:
             appliances = "(none detected)"
         print(f"  {result['window']:>6d} {time_str:>9s}  {appliances}")
+        
+        # Show anomalies if present
+        if 'anomalies' in result and result['anomalies']:
+            for anomaly in result['anomalies']:
+                print(f"    ⚠️  [{anomaly['severity'].upper()}] {anomaly['anomaly_type']}: {anomaly['message']}")
+
+    # Summary of anomalies
+    total_anomalies = sum(len(r.get('anomalies', [])) for r in results)
+    if total_anomalies > 0:
+        print(f"\n  Anomalies Detected: {total_anomalies} total")
+        anomaly_counts = {}
+        for result in results:
+            for anomaly in result.get('anomalies', []):
+                a_type = anomaly['anomaly_type']
+                anomaly_counts[a_type] = anomaly_counts.get(a_type, 0) + 1
+        for a_type, count in sorted(anomaly_counts.items(), key=lambda x: -x[1]):
+            print(f"    - {a_type}: {count}")
 
     print(f"{'='*60}")
 
@@ -648,7 +689,19 @@ def main():
     # ------------------------------------------------------------------
     # 6. Run inference
     # ------------------------------------------------------------------
-    print("\n[5/5] Running inference...")
+    # ------------------------------------------------------------------
+    # 5b. Initialize anomaly detection (optional)
+    # ------------------------------------------------------------------
+    anomaly_detector = None
+    if args.enable_anomaly_detection:
+        print("\n[5b/5] Initializing anomaly detection...")
+        history_path = args.anomaly_history or os.path.join(args.output, '.anomaly_history.json')
+        anomaly_detector = AnomalyDetector(appliance_names, history_file=history_path)
+        print(f"  Anomaly detector ready")
+        if args.measured_current:
+            print(f"  Using measured current for validation: {args.measured_current:.2f}A")
+
+    print(f"\n[5/5] Running inference...")
     t0 = time.time()
     predictions, probabilities = run_inference(
         model, windows, threshold, args.device, dtype, args.batch_size)
@@ -661,7 +714,10 @@ def main():
     # 6. Format and save results
     # ------------------------------------------------------------------
     results = format_results(
-        predictions, probabilities, timestamps, appliance_names, args.top_k)
+        predictions, probabilities, timestamps, appliance_names,
+        anomaly_detector=anomaly_detector,
+        measured_current=args.measured_current,
+        top_k=args.top_k)
 
     print_results_summary(results, appliance_names, predictions)
 
