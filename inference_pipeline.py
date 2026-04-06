@@ -2,26 +2,31 @@
 Fusion-ResNet Inference Pipeline for NILM Deployment
 =====================================================
 
-Sliding-window inference on continuous household electrical signals.
-Takes raw current waveform data and predicts which appliances are active
-in each time window.
+Inference on pre-processed features from the ESP32 hardware module.
+The ESP32 handles all preprocessing (FITPS, windowing, normalization, ICA, FFT, Fryze).
+This pipeline performs model inference on the pre-processed features.
 
 Usage:
-    # On a CSV file with 'Current' column (sampled at 30kHz)
+    # On pre-processed features from ESP32 (NPZ file)
     python inference_pipeline.py --checkpoint checkpoints/fusion_resnet/best.pt \
-        --input data/household_recording.csv --sample-rate 30000
+        --input preprocessed_features.npz --preprocessed
 
-    # On a NumPy file (already at 30kHz)
+    # On pre-processed features directory (batch processing)
     python inference_pipeline.py --checkpoint checkpoints/fusion_resnet/best.pt \
-        --input data/recording.npy --sample-rate 30000
+        --input /path/to/features/dir --preprocessed --device cpu --fp32
 
-    # On pre-segmented windows (400 samples each, already normalized)
-    python inference_pipeline.py --checkpoint checkpoints/fusion_resnet/best.pt \
-        --input data/windows.npy --pre-segmented
+    # With anomaly detection and measured current
+    python inference_pipeline.py --checkpoint best.pt --input features.npz \
+        --preprocessed --enable-anomaly-detection --measured-current 5.2 --device cpu
 
-    # With custom settings
-    python inference_pipeline.py --checkpoint best.pt --input recording.csv \
-        --sample-rate 30000 --window-size 400 --stride 200 --device cpu --fp32
+Legacy usage (for evaluation on raw signals - requires preprocessing):
+    # On a CSV file with 'Current' column
+    python inference_pipeline.py --checkpoint best.pt \
+        --input recording.csv --sample-rate 30000
+
+    # On pre-segmented raw windows
+    python inference_pipeline.py --checkpoint best.pt \
+        --input windows.npy --pre-segmented
 """
 
 from __future__ import annotations
@@ -60,11 +65,15 @@ def parse_args():
     parser.add_argument('--checkpoint', type=str, required=True,
                         help='Path to trained model checkpoint (.pt)')
     parser.add_argument('--input', type=str, required=True,
-                        help='Input file: .csv (with Current column), .npy, or directory')
+                        help='Input file: .npz (preprocessed), .csv (raw), .npy (raw), or directory')
     parser.add_argument('--output', type=str, default='inference_results',
                         help='Output directory for results')
+    parser.add_argument('--preprocessed', action='store_true',
+                        help='Input is pre-processed features from ESP32 (.npz with '
+                             'raw_window, fft_magnitude, fryze_active, fryze_reactive, ica_features)')
     parser.add_argument('--sample-rate', type=int, default=30000,
-                        help='Sampling rate of raw input data in Hz (default: 30000)')
+                        help='Sampling rate of raw input data in Hz (default: 30000). '
+                             'Ignored if --preprocessed is used.')
     parser.add_argument('--window-size', type=int, default=400,
                         help='Model input window size in samples (default: 400)')
     parser.add_argument('--stride', type=int, default=None,
@@ -80,7 +89,8 @@ def parse_args():
     parser.add_argument('--batch-size', type=int, default=256,
                         help='Inference batch size')
     parser.add_argument('--pre-segmented', action='store_true',
-                        help='Input is already segmented into windows (N, 400)')
+                        help='(Legacy) Input is already segmented into windows (N, 400). '
+                             'Use --preprocessed for ESP32 features.')
     parser.add_argument('--data-dir', type=str, default='data',
                         help='Directory with training data (for ICA fitting)')
     parser.add_argument('--ica-path', type=str, default=None,
@@ -191,6 +201,86 @@ def normalize_windows(windows: np.ndarray) -> np.ndarray:
     max_vals = np.abs(windows).max(axis=1, keepdims=True)
     max_vals = np.where(max_vals == 0, 1.0, max_vals)  # Avoid division by zero
     return windows / max_vals
+
+
+def load_preprocessed_features(input_path: str) -> tuple[dict[str, np.ndarray], np.ndarray | None]:
+    """
+    Load pre-processed features from ESP32.
+
+    Expected .npz structure:
+        - raw_window: (N, 400) - normalized current waveform
+        - fft_magnitude: (N, 200) - FFT magnitude spectrum
+        - fryze_active: (N, 50) - active power component
+        - fryze_reactive: (N, 50) - reactive power component
+        - ica_features: (N, 16) - ICA-decomposed components
+        - timestamps (optional): (N,) - Unix timestamps
+        - window_ids (optional): (N,) - window identifiers
+
+    Returns:
+        features: Dict with keys [raw_window, fft_magnitude, fryze_active, fryze_reactive, ica_features]
+                  Each value is (N, size) numpy array
+        timestamps: (N,) array of timestamps, or None if not in file
+    """
+    path = Path(input_path)
+
+    if path.is_dir():
+        # If input_path is a directory, concatenate all .npz files
+        all_features = {
+            'raw_window': [],
+            'fft_magnitude': [],
+            'fryze_active': [],
+            'fryze_reactive': [],
+            'ica_features': [],
+        }
+        all_timestamps = []
+
+        for f in sorted(path.glob('*.npz')):
+            feats, ts = load_preprocessed_features(str(f))
+            for k in all_features:
+                all_features[k].append(feats[k])
+            if ts is not None:
+                all_timestamps.extend(ts)
+
+        # Concatenate
+        for k in all_features:
+            all_features[k] = np.concatenate(all_features[k])
+
+        timestamps = np.array(all_timestamps) if all_timestamps else None
+        print(f"  Loaded {len(all_features['raw_window'])} preprocessed windows from {path}")
+        return all_features, timestamps
+
+    print(f"  Loading preprocessed features: {input_path}")
+
+    # Load .npz file
+    data = np.load(input_path)
+
+    features = {
+        'raw_window': data['raw_window'].astype(np.float64),
+        'fft_magnitude': data['fft_magnitude'].astype(np.float64),
+        'fryze_active': data['fryze_active'].astype(np.float64),
+        'fryze_reactive': data['fryze_reactive'].astype(np.float64),
+        'ica_features': data['ica_features'].astype(np.float64),
+    }
+
+    # Load timestamps if available
+    timestamps = data['timestamps'] if 'timestamps' in data.files else None
+
+    # Validate shapes
+    n = features['raw_window'].shape[0]
+    assert features['raw_window'].shape == (n, 400), \
+        f"raw_window shape {features['raw_window'].shape}, expected (N, 400)"
+    assert features['fft_magnitude'].shape == (n, 200), \
+        f"fft_magnitude shape {features['fft_magnitude'].shape}, expected (N, 200)"
+    assert features['fryze_active'].shape == (n, 50), \
+        f"fryze_active shape {features['fryze_active'].shape}, expected (N, 50)"
+    assert features['fryze_reactive'].shape == (n, 50), \
+        f"fryze_reactive shape {features['fryze_reactive'].shape}, expected (N, 50)"
+    assert features['ica_features'].shape == (n, 16), \
+        f"ica_features shape {features['ica_features'].shape}, expected (N, 16)"
+
+    print(f"  Loaded {n} preprocessed windows")
+    return features, timestamps
+
 
 
 # ==============================================================================
@@ -327,6 +417,80 @@ def run_inference(model, windows: np.ndarray, threshold: float,
     predictions = (probabilities >= threshold).astype(int)
 
     return predictions, probabilities
+
+
+def run_inference_preprocessed(model, feature_tensors: tuple,
+                               threshold: float, device: str, dtype: torch.dtype,
+                               batch_size: int = 256) -> tuple[np.ndarray, np.ndarray]:
+    """Run inference on pre-processed features from ESP32.
+
+    Args:
+        model: Trained model in eval mode (expects raw signal input)
+        feature_tensors: Tuple of 5 tensors
+            (raw_window, fft_magnitude, fryze_active, fryze_reactive, ica_features)
+            Each of shape (N, feature_size)
+        threshold: Classification threshold
+        device: 'cuda' or 'cpu'
+        dtype: torch.float32 or torch.float64
+        batch_size: Batch size for inference
+
+    Returns:
+        predictions: (N, n_classes) binary predictions
+        probabilities: (N, n_classes) sigmoid probabilities
+    """
+    raw_window, fft_magnitude, fryze_active, fryze_reactive, ica_features = feature_tensors
+    n_samples = raw_window.shape[0]
+    all_probs = []
+
+    # Create a wrapper that handles pre-processed features
+    # The model's branches expect the full preprocessing pipeline,
+    # so we shortcut by sending features directly to each branch
+    with torch.no_grad():
+        for i in range(0, n_samples, batch_size):
+            end_idx = min(i + batch_size, n_samples)
+            
+            # Extract batch
+            raw_batch = raw_window[i:end_idx]
+            fft_batch = fft_magnitude[i:end_idx]
+            fryze_a_batch = fryze_active[i:end_idx]
+            fryze_r_batch = fryze_reactive[i:end_idx]
+            ica_batch = ica_features[i:end_idx]
+
+            # Branch 1: Raw signal (already normalized)
+            raw_feat = model.raw_branch(raw_batch)
+
+            # Branch 2: ICA (features already computed)
+            ica_expanded = ica_batch.unsqueeze(1)  # (B, 1, 16)
+            ica_feat = model.ica_branch.stem(ica_expanded)
+            ica_feat = model.ica_branch.stages(ica_feat)
+            ica_feat = model.ica_branch.pool(ica_feat).squeeze(-1)
+
+            # Branch 3: Fryze (features already decomposed)
+            fryze_stack = torch.stack([fryze_r_batch, fryze_a_batch], dim=1)  # (B, 2, 50)
+            fryze_feat = model.fryze_branch.stem(fryze_stack)
+            fryze_feat = model.fryze_branch.stages(fryze_feat)
+            fryze_feat = model.fryze_branch.pool(fryze_feat).squeeze(-1)
+
+            # Branch 4: FFT (pre-computed magnitude)
+            fft_expanded = fft_batch.unsqueeze(1)  # (B, 1, 200)
+            fft_feat = model.fft_branch.stem(fft_expanded)
+            fft_feat = model.fft_branch.stages(fft_feat)
+            fft_feat = model.fft_branch.pool(fft_feat).squeeze(-1)
+
+            # Fuse branches
+            feats = [raw_feat, ica_feat, fryze_feat, fft_feat]
+            fused = model.fusion(feats)
+
+            # Classify
+            logits = model.classifier(fused)
+            probs = torch.sigmoid(logits).cpu().numpy()
+            all_probs.append(probs)
+
+    probabilities = np.concatenate(all_probs, axis=0)
+    predictions = (probabilities >= threshold).astype(int)
+
+    return predictions, probabilities
+
 
 
 # ==============================================================================
@@ -522,6 +686,88 @@ def print_results_summary(results: list[dict], appliance_names: list[str],
     print(f"{'='*60}")
 
 
+def create_mobile_payload(results: list[dict], appliance_names: list[str],
+                         predictions: np.ndarray, probabilities: np.ndarray,
+                         model_version: str = "1.0",
+                         inference_time_ms: float = 0.0) -> dict:
+    """
+    Create a standardized payload for mobile client (app/dashboard).
+
+    This formats the inference results into a clean JSON structure
+    suitable for real-time visualization and alerts on mobile devices.
+
+    Args:
+        results: List of per-window results from format_results()
+        appliance_names: List of appliance names
+        predictions: (N, n_classes) binary predictions
+        probabilities: (N, n_classes) confidence scores
+        model_version: Model version string
+        inference_time_ms: Inference time for this batch in milliseconds
+
+    Returns:
+        Dict with aggregated predictions, anomalies, and health info
+    """
+    n_windows = len(results)
+
+    # Aggregate appliance activity
+    appliance_stats = {}
+    for i, name in enumerate(appliance_names):
+        detections = predictions[:, i].sum()
+        detection_rate = detections / n_windows * 100 if n_windows > 0 else 0
+        avg_confidence = probabilities[predictions[:, i] == 1, i].mean() \
+            if (predictions[:, i] == 1).any() else 0.0
+
+        appliance_stats[name] = {
+            'detected': bool(detections > 0),
+            'detection_rate': float(detection_rate),
+            'detections': int(detections),
+            'avg_confidence': float(avg_confidence),
+            'max_confidence': float(probabilities[:, i].max()),
+            'min_confidence': float(probabilities[:, i].min()),
+        }
+
+    # Aggregate anomalies
+    all_anomalies = []
+    anomaly_counts = {}
+    for result in results:
+        if 'anomalies' in result:
+            for anomaly in result['anomalies']:
+                all_anomalies.append({
+                    'window': result['window'],
+                    'type': anomaly['anomaly_type'],
+                    'severity': anomaly['severity'],
+                    'message': anomaly['message'],
+                    'timestamp': result.get('timestamp', None),
+                })
+                a_type = anomaly['anomaly_type']
+                anomaly_counts[a_type] = anomaly_counts.get(a_type, 0) + 1
+
+    # Create mobile payload
+    payload = {
+        'metadata': {
+            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'model_version': model_version,
+            'variant': 'preprocessed',  # Input is pre-processed features
+            'n_windows': n_windows,
+            'inference_time_ms': float(inference_time_ms),
+        },
+        'summary': {
+            'most_active_appliance': max(
+                appliance_stats.items(),
+                key=lambda x: x[1]['detection_rate']
+            )[0] if appliance_stats else None,
+            'avg_active_per_window': float(predictions.sum(axis=1).mean()),
+            'total_anomalies': len(all_anomalies),
+            'anomaly_types': anomaly_counts,
+        },
+        'appliances': appliance_stats,
+        'anomalies': all_anomalies,
+        'recent_windows': results[:min(10, n_windows)],  # Last 10 for debugging
+    }
+
+    return payload
+
+
 def save_results(results: list[dict], predictions: np.ndarray,
                  probabilities: np.ndarray, timestamps: np.ndarray | None,
                  windows: np.ndarray, appliance_names: list[str],
@@ -597,6 +843,7 @@ def main():
     print(f"  Fusion-ResNet NILM Inference Pipeline")
     print(f"{'='*60}")
     print(f"  Device: {args.device} | Dtype: {dtype}")
+    print(f"  Input Mode: {'PRE-PROCESSED (ESP32)' if args.preprocessed else 'RAW SIGNAL'}")
     print(f"  Checkpoint: {args.checkpoint}")
     print(f"  Input: {args.input}")
 
@@ -647,23 +894,27 @@ def main():
     # ------------------------------------------------------------------
     # 3. Load/Fit ICA parameters (with correct n_components from checkpoint)
     # ------------------------------------------------------------------
-    print("\n[2/5] Preparing ICA parameters...")
-    if args.ica_path and os.path.exists(args.ica_path):
-        ica_params = load_ica_params(args.ica_path)
-        # Validate dimensions match checkpoint
-        if ica_params['U'].shape[0] != n_ica_components:
-            print(f"  Warning: saved ICA has {ica_params['U'].shape[0]} components "
-                  f"but checkpoint expects {n_ica_components}. Re-fitting...")
+    ica_params = None
+    if not args.preprocessed:
+        print("\n[2/5] Preparing ICA parameters...")
+        if args.ica_path and os.path.exists(args.ica_path):
+            ica_params = load_ica_params(args.ica_path)
+            # Validate dimensions match checkpoint
+            if ica_params['U'].shape[0] != n_ica_components:
+                print(f"  Warning: saved ICA has {ica_params['U'].shape[0]} components "
+                      f"but checkpoint expects {n_ica_components}. Re-fitting...")
+                ica_params = fit_ica_from_training_data(args.data_dir, n_ica_components)
+                ica_save_path = os.path.join(args.data_dir, 'ica_params.npz')
+                save_ica_params(ica_params, ica_save_path)
+            else:
+                print(f"  Loaded ICA from: {args.ica_path}")
+        else:
             ica_params = fit_ica_from_training_data(args.data_dir, n_ica_components)
+            # Auto-save for future use
             ica_save_path = os.path.join(args.data_dir, 'ica_params.npz')
             save_ica_params(ica_params, ica_save_path)
-        else:
-            print(f"  Loaded ICA from: {args.ica_path}")
     else:
-        ica_params = fit_ica_from_training_data(args.data_dir, n_ica_components)
-        # Auto-save for future use
-        ica_save_path = os.path.join(args.data_dir, 'ica_params.npz')
-        save_ica_params(ica_params, ica_save_path)
+        print("\n[2/5] Skipping ICA (input is pre-processed)")
 
     # ------------------------------------------------------------------
     # 4. Load model
@@ -679,12 +930,30 @@ def main():
     # ------------------------------------------------------------------
     # 5. Load and preprocess input
     # ------------------------------------------------------------------
-    print("\n[4/5] Loading and preprocessing input...")
-    windows, timestamps = load_input(
-        args.input, args.pre_segmented, args.sample_rate,
-        args.window_size, stride)
-
-    print(f"  Windows ready: {windows.shape}")
+    print("\n[4/5] Loading input...")
+    
+    if args.preprocessed:
+        # Load pre-processed features from ESP32
+        features, timestamps = load_preprocessed_features(args.input)
+        
+        # Convert features to model input tensors
+        raw_window = torch.tensor(features['raw_window'], dtype=dtype, device=args.device)
+        fft_magnitude = torch.tensor(features['fft_magnitude'], dtype=dtype, device=args.device)
+        fryze_active = torch.tensor(features['fryze_active'], dtype=dtype, device=args.device)
+        fryze_reactive = torch.tensor(features['fryze_reactive'], dtype=dtype, device=args.device)
+        ica_features = torch.tensor(features['ica_features'], dtype=dtype, device=args.device)
+        
+        feature_tensors = (raw_window, fft_magnitude, fryze_active, fryze_reactive, ica_features)
+        n_windows = raw_window.shape[0]
+        print(f"  Pre-processed features ready: {n_windows} windows")
+    else:
+        # Load raw signal and preprocess
+        windows, timestamps = load_input(
+            args.input, args.pre_segmented, args.sample_rate,
+            args.window_size, stride)
+        
+        print(f"  Windows ready: {windows.shape}")
+        feature_tensors = None
 
     # ------------------------------------------------------------------
     # 6. Run inference
@@ -703,12 +972,21 @@ def main():
 
     print(f"\n[5/5] Running inference...")
     t0 = time.time()
-    predictions, probabilities = run_inference(
-        model, windows, threshold, args.device, dtype, args.batch_size)
+    
+    if args.preprocessed:
+        # Inference on pre-processed features
+        predictions, probabilities = run_inference_preprocessed(
+            model, feature_tensors, threshold, args.device, dtype, args.batch_size)
+        windows = feature_tensors[0].cpu().numpy()  # For saving
+    else:
+        # Inference on raw windows
+        predictions, probabilities = run_inference(
+            model, windows, threshold, args.device, dtype, args.batch_size)
+    
     elapsed = time.time() - t0
 
-    print(f"  Inference complete: {len(windows)} windows in {elapsed:.2f}s "
-          f"({len(windows) / elapsed:.0f} windows/sec)")
+    print(f"  Inference complete: {len(predictions)} windows in {elapsed:.2f}s "
+          f"({len(predictions) / elapsed:.0f} windows/sec)")
 
     # ------------------------------------------------------------------
     # 6. Format and save results
@@ -732,6 +1010,17 @@ def main():
                  windows, appliance_names, args.output,
                  sample_rate=args.sample_rate,
                  window_duration_s=window_duration_s)
+
+    # Save mobile payload
+    mobile_payload = create_mobile_payload(
+        results, appliance_names, predictions, probabilities,
+        model_version="1.0",
+        inference_time_ms=elapsed * 1000)
+    
+    mobile_payload_path = os.path.join(args.output, 'mobile_payload.json')
+    with open(mobile_payload_path, 'w') as f:
+        json.dump(mobile_payload, f, indent=2)
+    print(f"  Saved: {mobile_payload_path}")
 
     print(f"\nDone! Results saved to {args.output}/")
     print(f"  Run postprocessing:")
