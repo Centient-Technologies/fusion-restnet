@@ -7,7 +7,7 @@
 The system is built around an ESP32 microcontroller that reads electrical measurements from sensors clamped onto the household main power line, then transmits the data over WiFi to a server for processing.
 
 ```
-┌─────────── MAIN POWER LINE (120V AC, 60Hz) ───────────┐
+┌─────────── MAIN POWER LINE (230V AC, 50Hz) ───────────┐
 │                                                         │
 │  ┌──────────┐                                          │
 │  │ SCT013   │ ← clamps around the live wire            │
@@ -108,14 +108,14 @@ Raw current from sensor (e.g., 30kHz or whatever the hardware captures)
 │
 ▼ FITPS transform (Fundamental Identification and Time-Period Standardization)
 │
-│  1. Finds the fundamental 60Hz frequency in the signal
+│  1. Finds the fundamental 50Hz frequency in the signal
 │  2. Aligns the signal to exact cycle boundaries
 │  3. Resamples each cycle to exactly 500 points
 │
 ▼ Result: Clean signal with 500 samples per cycle
 ```
 
-One cycle at 60Hz = 16.67 milliseconds = exactly 500 samples after FITPS.
+One cycle at 50Hz = 20 milliseconds = exactly 500 samples after FITPS.
 
 ### Stage 2: Steady-State Detection
 
@@ -178,6 +178,8 @@ Clean single-appliance windows
 ```
 
 This step only happens during training. During inference on real household data, the signal coming from the main power line is already a natural mixture of all active appliances.
+
+**Note:** This model has been updated for Ghana power standard (50Hz). The original model was trained on 60Hz data (PLAID dataset). Retraining on 50Hz Ghana-sourced data is required for optimal performance. See FREQUENCY_CHANGE_ANALYSIS.md for details.
 
 ### Stage 6: Normalization
 

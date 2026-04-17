@@ -108,7 +108,7 @@ for set_num in tqdm(range(1,576,1)):
             time_list.append( [on_cur, off_cur] )
             devices_list.append(apl["type"])
 
-    fitps = FITPS(60)
+    fitps = FITPS(50)
     data_u_all, data_i_all = fitps(data_u_all, data_i_all, freq_list[0])
 
     jumps_list = where_jumps(data_i_all)
@@ -129,7 +129,7 @@ for set_num in tqdm(range(1,576,1)):
                 data_i = data_agg["Current"][time_left:time_right].values
                 data_u = data_agg["Voltage"][time_left:time_right].values
 
-                fitps = FITPS(60)
+                fitps = FITPS(50)
                 data_u, data_i = fitps(data_u, data_i, freq_list[0])
   
                 devices_cur = []
@@ -192,7 +192,7 @@ for set_num in tqdm(range(1800,1877,1)):
     except:
         device_cur = None 
     
-    fitps = FITPS(60)
+    fitps = FITPS(50)
     data_u_all, data_i_all = fitps(data_u_all, data_i_all, freq_list[0])
 
     jumps_list = where_jumps(data_i_all)
@@ -226,7 +226,7 @@ for set_num in tqdm(range(1800,1877,1)):
                         mark_mean = False
                         break
 
-                fitps = FITPS(60)
+                fitps = FITPS(50)
                 data_u, data_i = fitps(data_u, data_i, freq_list[0])
                                   
                 if device_cur and (mark_mean) and (np.amax(np.abs(data_i))>0.1): #threshhold to remove noises

@@ -71,7 +71,7 @@ np.savez('preprocessed_features.npz',
 
 | Feature | Shape | Description |
 |---------|-------|-------------|
-| **raw_window** | (N, 400) | Normalized current waveform (10 electrical cycles @ 60Hz) |
+| **raw_window** | (N, 400) | Normalized current waveform (10 electrical cycles @ 50Hz) |
 | **fft_magnitude** | (N, 200) | FFT magnitude spectrum (harmonics up to ~4 kHz) |
 | **fryze_active** | (N, 50) | Active (real) power component over 10 cycles |
 | **fryze_reactive** | (N, 50) | Reactive (imaginary) power component |
