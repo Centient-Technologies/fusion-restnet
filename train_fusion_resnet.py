@@ -400,7 +400,7 @@ def train_model(model, train_loader, val_loader, loss_fn, optimizer, scheduler,
             best_val = val_stats['val/score']
             ckpt["best_val_f1"] = best_val
             if save_dir:
-                torch.save(ckpt, f"{save_dir}/best.pt")
+                torch.save(ckpt, f"{save_dir}/latest-v0.0.1-dev.pt")
 
         if save_dir and save_every > 0 and ((epoch + 1) % save_every == 0):
             torch.save(ckpt, f"{save_dir}/last.pt")
@@ -420,7 +420,7 @@ def train_model(model, train_loader, val_loader, loss_fn, optimizer, scheduler,
         }
         if checkpoint_meta:
             ckpt.update(checkpoint_meta)
-        torch.save(ckpt, f"{save_dir}/last.pt")
+        torch.save(ckpt, f"{save_dir}/last-v0.0.1-dev.pt")
 
     print(f"\nBest validation F1: {best_val:.4f}")
     return history
