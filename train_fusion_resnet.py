@@ -5,18 +5,20 @@ Fusion-ResNet Training Script for NILM Energy Disaggregation
 This script trains the Fusion-ResNet model on the PLAID dataset.
 Compatible with both local GPU and Google Colab.
 
+Checkpoints are saved with semantic versioning: latest_v{version}.pt
+
 Usage:
-    # Local (with CUDA GPU)
-    python train_fusion_resnet.py --device cuda --variant full
+    # Local (with CUDA GPU) - default 300 epochs
+    python train_fusion_resnet.py --device cuda --variant full --model-version 0.0.1-dev
+
+    # With custom epochs
+    python train_fusion_resnet.py --device cuda --variant full --epochs 300 --model-version 1.0.0
 
     # Local with limited GPU (RTX 2050 / 4GB VRAM)
-    python train_fusion_resnet.py --device cuda --variant lite --batch-size 64 --fp32
-
-    # Google Colab (recommended for full model)
-    python train_fusion_resnet.py --device cuda --variant full --epochs 250
+    python train_fusion_resnet.py --device cuda --variant lite --batch-size 64 --fp32 --model-version 0.0.1-dev
 
     # CPU fallback
-    python train_fusion_resnet.py --device cpu --variant lite --epochs 50
+    python train_fusion_resnet.py --device cpu --variant lite --epochs 100 --model-version 0.0.1-dev
 """
 
 from __future__ import annotations
@@ -73,9 +75,9 @@ plt.rcParams.update({
 
 # Default appliance names for PLAID (will be overridden if label_encoder exists)
 DEFAULT_APPLIANCE_NAMES = [
-    'Air Conditioner', 'Blender', 'Coffee maker', 'CFL',
+    'Air Conditioner', 'Blender', 'Coffee maker', 'Compact Fluorescent Lamp',
     'Fan', 'Fridge', 'Hair Iron', 'Hairdryer', 'Heater',
-    'Incand. Bulb', 'Laptop', 'Microwave', 'Soldering Iron',
+    'Incandescent Light Bulb', 'Laptop', 'Microwave', 'Soldering Iron',
     'Vacuum', 'Washing Machine', 'Water kettle',
 ]
 
@@ -89,8 +91,10 @@ def parse_args():
                         choices=['cuda', 'cpu'], help='Device to use')
     parser.add_argument('--variant', type=str, default='full',
                         choices=['full', 'lite'], help='Model variant')
-    parser.add_argument('--epochs', type=int, default=200, help='Training epochs')
+    parser.add_argument('--epochs', type=int, default=300, help='Training epochs')
     parser.add_argument('--batch-size', type=int, default=128, help='Batch size')
+    parser.add_argument('--model-version', type=str, default='0.0.1-dev',
+                        help='Model version tag (e.g., 0.0.1-dev, 1.0.0, 1.0.0-rc1)')
     parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
     parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
     parser.add_argument('--fp32', action='store_true',
@@ -331,7 +335,7 @@ def val_epoch(model, loader, loss_fn, device, dtype):
 
 
 def train_model(model, train_loader, val_loader, loss_fn, optimizer, scheduler,
-                num_epochs, device, dtype, save_dir=''):
+                num_epochs, device, dtype, save_dir='', checkpoint_meta=None):
     history = {
         "train": {"loss": [], "score": []},
         "val": {"loss": [], "score": []},
@@ -375,21 +379,27 @@ def train_model(model, train_loader, val_loader, loss_fn, optimizer, scheduler,
         if val_stats['val/score'] > best_val:
             best_val = val_stats['val/score']
             if save_dir:
-                torch.save({
+                ckpt = {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "best_val_f1": best_val,
                     "threshold": val_stats['threshold'],
-                }, f"{save_dir}/best.pt")
+                }
+                if checkpoint_meta:
+                    ckpt.update(checkpoint_meta)
+                torch.save(ckpt, f"{save_dir}/best.pt")
 
     if save_dir:
-        torch.save({
+        ckpt = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "threshold": val_stats.get('threshold', 0.5),
-        }, f"{save_dir}/last.pt")
+        }
+        if checkpoint_meta:
+            ckpt.update(checkpoint_meta)
+        torch.save(ckpt, f"{save_dir}/last.pt")
 
     print(f"\nBest validation F1: {best_val:.4f}")
     return history
@@ -819,16 +829,15 @@ def main():
             pass
 
     # Drop rare classes (< 10 samples)
-    _, counts = np.unique(y_real, return_counts=True)
-    to_drop = np.argwhere(counts < 10).ravel()
-    for idx in to_drop:
-        mask = y_real != idx
-        y_real = y_real[mask]
-        X_real = X_real[mask]
+    class_ids, counts = np.unique(y_real, return_counts=True)
+    kept_class_ids = [int(cls) for cls, count in zip(class_ids, counts) if count >= 10]
+    keep_mask = np.isin(y_real, kept_class_ids)
+    y_real = y_real[keep_mask]
+    X_real = X_real[keep_mask]
 
     n_classes = len(np.unique(y_real))
     signal_length = X_real.shape[1]
-    appliance_names = appliance_names[:n_classes]
+    appliance_names = [str(appliance_names[idx]) for idx in kept_class_ids]
     print(f"Classes: {n_classes} | Signal length: {signal_length} | "
           f"Samples: {len(X_real)}")
     print(f"Appliances: {appliance_names}")
@@ -856,9 +865,12 @@ def main():
     print(f"Train: {len(X_train)} | Val: {len(X_val)} | Test: {len(X_test)}")
 
     # Normalize to unit magnitude
-    X_train = X_train / np.abs(X_train).max(axis=1, keepdims=True)
-    X_val = X_val / np.abs(X_val).max(axis=1, keepdims=True)
-    X_test = X_test / np.abs(X_test).max(axis=1, keepdims=True)
+    X_train = X_train / np.where(np.abs(X_train).max(axis=1, keepdims=True) == 0, 1.0,
+                                 np.abs(X_train).max(axis=1, keepdims=True))
+    X_val = X_val / np.where(np.abs(X_val).max(axis=1, keepdims=True) == 0, 1.0,
+                             np.abs(X_val).max(axis=1, keepdims=True))
+    X_test = X_test / np.where(np.abs(X_test).max(axis=1, keepdims=True) == 0, 1.0,
+                               np.abs(X_test).max(axis=1, keepdims=True))
 
     # ------------------------------------------------------------------
     # 3. ICA for the ICA branch
@@ -913,6 +925,14 @@ def main():
         model, train_loader, val_loader, loss_fn, optimizer, scheduler,
         num_epochs=args.epochs, device=args.device, dtype=dtype,
         save_dir=args.save_dir,
+        checkpoint_meta={
+            "appliance_names": appliance_names,
+            "kept_class_ids": kept_class_ids,
+            "variant": args.variant,
+            "signal_length": signal_length,
+            "n_classes": n_classes,
+            "model_version": args.model_version,
+        },
     )
 
     # ------------------------------------------------------------------
@@ -921,14 +941,25 @@ def main():
     print(f"\n[6/6] Evaluating and generating plots...")
     threshold = history['threshold'][-1]
 
-    # Load best checkpoint
-    ckpt_path = f"{args.save_dir}/best.pt"
+    # Load best checkpoint with versioning support
+    versioned_ckpt_path = f"{args.save_dir}/latest_v{args.model_version}.pt"
+    legacy_ckpt_path = f"{args.save_dir}/best.pt"
+    ckpt_path = versioned_ckpt_path if os.path.exists(versioned_ckpt_path) else legacy_ckpt_path
     if os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=args.device, weights_only=True)
         model.load_state_dict(ckpt['model_state_dict'])
         threshold = ckpt.get('threshold', threshold)
         print(f"Loaded best checkpoint (epoch {ckpt['epoch']}, "
               f"val F1 = {ckpt.get('best_val_f1', 'N/A'):.4f})")
+        
+        # Save versioned checkpoint if not already saved
+        if ckpt_path == legacy_ckpt_path:  # Only if we loaded from legacy path
+            torch.save(ckpt, versioned_ckpt_path)
+            print(f"  Saved versioned checkpoint: {versioned_ckpt_path}")
+    elif os.path.exists(legacy_ckpt_path):
+        ckpt = torch.load(legacy_ckpt_path, map_location=args.device, weights_only=True)
+        torch.save(ckpt, versioned_ckpt_path)
+        print(f"  Saved versioned checkpoint: {versioned_ckpt_path}")
 
     Y_pred, Y_prob, metrics = evaluate(
         model, X_test, Y_test, threshold, args.device, dtype, n_classes,

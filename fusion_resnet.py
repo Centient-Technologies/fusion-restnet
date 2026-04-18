@@ -565,6 +565,306 @@ class FusionResNet(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
 
+class _PrecomputedSingleChannelBranch(nn.Module):
+    """Conv branch for precomputed 1D feature sequences."""
+
+    def __init__(self, input_channels: int, channels: list[int], dropout: float = 0.1,
+                 stem_kernel_size: int = 3, stem_stride: int = 1):
+        super().__init__()
+        padding = stem_kernel_size // 2
+        self.stem = nn.Sequential(
+            nn.Conv1d(input_channels, channels[0], kernel_size=stem_kernel_size,
+                      stride=stem_stride, padding=padding),
+            nn.BatchNorm1d(channels[0]),
+            nn.ReLU(inplace=True),
+        )
+
+        stages = []
+        in_ch = channels[0]
+        for out_ch in channels[1:]:
+            stages.append(ResStage(in_ch, out_ch, num_blocks=2, stride=1, dropout=dropout))
+            in_ch = out_ch
+        self.stages = nn.Sequential(*stages)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.out_dim = channels[-1]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.stages(x)
+        return self.pool(x).squeeze(-1)
+
+
+class _PrecomputedDownsampleBranch(nn.Module):
+    """Conv branch for precomputed sequences that still benefit from downsampling."""
+
+    def __init__(self, input_channels: int, channels: list[int], dropout: float = 0.1,
+                 stem_kernel_size: int = 7, stem_stride: int = 2):
+        super().__init__()
+        padding = stem_kernel_size // 2
+        self.stem = nn.Sequential(
+            nn.Conv1d(input_channels, channels[0], kernel_size=stem_kernel_size,
+                      stride=stem_stride, padding=padding),
+            nn.BatchNorm1d(channels[0]),
+            nn.ReLU(inplace=True),
+        )
+
+        stages = []
+        in_ch = channels[0]
+        for out_ch in channels[1:]:
+            stages.append(ResStage(in_ch, out_ch, num_blocks=2, stride=2, dropout=dropout))
+            in_ch = out_ch
+        self.stages = nn.Sequential(*stages)
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.out_dim = channels[-1]
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+        x = self.stages(x)
+        return self.pool(x).squeeze(-1)
+
+
+class FusionResNetSplit(nn.Module):
+    """Split-head Fusion-ResNet for hardware-preprocessed multi-input inference."""
+
+    def __init__(
+        self,
+        n_classes: int,
+        signal_length: int = 400,
+        branch_channels: list[int] = None,
+        fused_dim: int = 256,
+        dropout: float = 0.1,
+        emb_size: int = 50,
+        ica_components: int = 16,
+        fft_bins: int | None = None,
+    ):
+        super().__init__()
+        if branch_channels is None:
+            branch_channels = [32, 64, 128]
+        if fft_bins is None:
+            fft_bins = signal_length // 2
+
+        self.n_classes = n_classes
+        self.signal_length = signal_length
+        self.emb_size = emb_size
+        self.ica_components = ica_components
+        self.fft_bins = fft_bins
+
+        self.raw_branch = RawSignalBranch(
+            signal_length=signal_length,
+            channels=branch_channels,
+            dropout=dropout,
+        )
+        self.ica_branch = _PrecomputedSingleChannelBranch(
+            input_channels=1,
+            channels=branch_channels,
+            dropout=dropout,
+            stem_kernel_size=3,
+            stem_stride=1,
+        )
+        self.fryze_branch = _PrecomputedDownsampleBranch(
+            input_channels=2,
+            channels=branch_channels,
+            dropout=dropout,
+            stem_kernel_size=5,
+            stem_stride=1,
+        )
+        self.fft_branch = _PrecomputedDownsampleBranch(
+            input_channels=1,
+            channels=branch_channels,
+            dropout=dropout,
+            stem_kernel_size=7,
+            stem_stride=2,
+        )
+
+        self.fusion = AttentionFusion(
+            branch_dims=[
+                self.raw_branch.out_dim,
+                self.ica_branch.out_dim,
+                self.fryze_branch.out_dim,
+                self.fft_branch.out_dim,
+            ],
+            fused_dim=fused_dim,
+            dropout=dropout,
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Linear(fused_dim, fused_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(fused_dim, fused_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(fused_dim // 2, n_classes),
+        )
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm1d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        raw_signal: torch.Tensor,
+        fft_magnitude: torch.Tensor,
+        fryze_active: torch.Tensor,
+        fryze_reactive: torch.Tensor,
+        ica_features: torch.Tensor,
+    ) -> torch.Tensor:
+        feats = [
+            self.raw_branch(raw_signal),
+            self.ica_branch(ica_features.unsqueeze(1)),
+            self.fryze_branch(torch.stack([fryze_reactive, fryze_active], dim=1)),
+            self.fft_branch(fft_magnitude.unsqueeze(1)),
+        ]
+        fused = self.fusion(feats)
+        return self.classifier(fused)
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+def extract_ica_params_from_checkpoint(checkpoint_or_state_dict: dict) -> dict:
+    """Extract ICA preprocessing tensors from a full FusionResNet checkpoint."""
+    state_dict = checkpoint_or_state_dict.get('model_state_dict', checkpoint_or_state_dict)
+    required = {
+        'U': 'ica_branch.ica.U',
+        'M': 'ica_branch.ica.M',
+        'm': 'ica_branch.norm.m',
+        's': 'ica_branch.norm.s',
+    }
+    missing = [key for key in required.values() if key not in state_dict]
+    if missing:
+        raise KeyError(f"Checkpoint is missing ICA tensors required for split deployment: {missing}")
+    return {
+        name: state_dict[key].detach().cpu().numpy().copy()
+        for name, key in required.items()
+    }
+
+
+def transfer_weights_from_full_state_dict(
+    checkpoint_or_state_dict: dict,
+    split_model: FusionResNetSplit,
+    strict: bool = True,
+) -> tuple[FusionResNetSplit, dict]:
+    """Copy learned branch/fusion/head weights from full model into a split model."""
+    state_dict = checkpoint_or_state_dict.get('model_state_dict', checkpoint_or_state_dict)
+    split_state = split_model.state_dict()
+    transferred = {}
+
+    for key in split_state:
+        if key in state_dict:
+            src = state_dict[key]
+            if split_state[key].shape != src.shape:
+                raise ValueError(
+                    f"Shape mismatch for {key}: split={tuple(split_state[key].shape)} "
+                    f"full={tuple(src.shape)}"
+                )
+            transferred[key] = src.detach().clone()
+
+    missing = [key for key in split_state if key not in transferred]
+    if strict and missing:
+        raise KeyError(f"Missing weights for split model transfer: {missing}")
+
+    split_model.load_state_dict(transferred, strict=False)
+    return split_model, extract_ica_params_from_checkpoint(state_dict)
+
+
+def build_split_model_from_full_checkpoint(
+    checkpoint_or_state_dict: dict,
+    dtype: torch.dtype | None = None,
+    device: torch.device | str | None = None,
+) -> tuple[FusionResNetSplit, dict]:
+    """Instantiate a split-head model directly from a trained full-model checkpoint."""
+    ckpt = checkpoint_or_state_dict
+    state_dict = ckpt.get('model_state_dict', ckpt)
+
+    classifier_weight_key = [k for k in state_dict if 'classifier' in k and 'weight' in k][-1]
+    n_classes = state_dict[classifier_weight_key].shape[0]
+    signal_length = int(ckpt.get('signal_length', 400))
+    ica_components = int(state_dict['ica_branch.ica.U'].shape[0])
+    fft_bins = int(state_dict['fft_branch.n_freqs']) if 'fft_branch.n_freqs' in state_dict else signal_length // 2
+
+    fused_dim = int(state_dict['classifier.0.weight'].shape[0])
+    branch_dims = int(state_dict['fusion.projections.0.weight'].shape[1])
+    branch_channels = [
+        int(state_dict['raw_branch.stem.0.weight'].shape[0]),
+        int(state_dict['raw_branch.stages.0.blocks.0.conv1.weight'].shape[0]),
+        int(state_dict['raw_branch.stages.1.blocks.0.conv1.weight'].shape[0]),
+    ]
+    dropout = 0.1
+
+    split_model = FusionResNetSplit(
+        n_classes=n_classes,
+        signal_length=signal_length,
+        branch_channels=branch_channels,
+        fused_dim=fused_dim,
+        dropout=dropout,
+        emb_size=50,
+        ica_components=ica_components,
+        fft_bins=fft_bins,
+    )
+    split_model, ica_params = transfer_weights_from_full_state_dict(state_dict, split_model)
+
+    if dtype is not None:
+        split_model = split_model.to(dtype=dtype)
+    if device is not None:
+        split_model = split_model.to(device)
+    split_model.eval()
+    return split_model, ica_params
+
+
+class FusionResNetPreprocessed(nn.Module):
+    """Wrapper for running Fusion-ResNet on externally precomputed features."""
+
+    def __init__(self, base_model: FusionResNet):
+        super().__init__()
+        self.base_model = base_model
+        self.n_classes = base_model.n_classes
+
+    def forward(
+        self,
+        raw_window: torch.Tensor,
+        fft_magnitude: torch.Tensor,
+        fryze_active: torch.Tensor,
+        fryze_reactive: torch.Tensor,
+        ica_features: torch.Tensor,
+    ) -> torch.Tensor:
+        feats = [self.base_model.raw_branch(raw_window)]
+
+        if not getattr(self.base_model, 'has_ica', False):
+            raise RuntimeError("Preprocessed inference requires a model with an ICA branch.")
+
+        ica_feat = self.base_model.ica_branch.stem(ica_features.unsqueeze(1))
+        ica_feat = self.base_model.ica_branch.stages(ica_feat)
+        ica_feat = self.base_model.ica_branch.pool(ica_feat).squeeze(-1)
+        feats.append(ica_feat)
+
+        fryze_stack = torch.stack([fryze_reactive, fryze_active], dim=1)
+        fryze_feat = self.base_model.fryze_branch.stem(fryze_stack)
+        fryze_feat = self.base_model.fryze_branch.stages(fryze_feat)
+        fryze_feat = self.base_model.fryze_branch.pool(fryze_feat).squeeze(-1)
+        feats.append(fryze_feat)
+
+        fft_feat = self.base_model.fft_branch.stem(fft_magnitude.unsqueeze(1))
+        fft_feat = self.base_model.fft_branch.stages(fft_feat)
+        fft_feat = self.base_model.fft_branch.pool(fft_feat).squeeze(-1)
+        feats.append(fft_feat)
+
+        fused = self.base_model.fusion(feats)
+        return self.base_model.classifier(fused)
+
+
 # ==============================================================================
 # Lightweight variant for constrained hardware (4GB VRAM)
 # ==============================================================================

@@ -13,7 +13,7 @@ Usage:
         predictions=predictions_array,   # (n_appliances,)
         probabilities=probabilities_array,
         measured_current=measured_rms,   # from PZEM or similar
-        timestamp=datetime.now()
+        timestamp=datetime.now(timezone.utc)
     )
     if anomalies:
         for alert in anomalies:
@@ -24,8 +24,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, asdict
 from typing import Optional
 
@@ -126,7 +125,7 @@ class AnomalyDetector:
             List of detected anomalies
         """
         if timestamp is None:
-            timestamp = datetime.now()
+            timestamp = datetime.now(timezone.utc)
 
         timestamp_str = timestamp.isoformat()
         anomalies = []
@@ -225,7 +224,7 @@ class AnomalyDetector:
             return {'appliance': appliance_name, 'message': 'No data yet'}
 
         # Filter to time window
-        cutoff_time = datetime.now() - timedelta(days=days)
+        cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
         recent = [prob for ts, prob in history if datetime.fromisoformat(ts) >= cutoff_time]
 
         if not recent:
@@ -258,7 +257,7 @@ class AnomalyDetector:
             health_per_appliance[name] = self.get_appliance_health(name, days)
 
         return {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'time_span_days': days,
             'appliances': health_per_appliance,
             'overall_status': 'healthy',  # Could add logic to summarize

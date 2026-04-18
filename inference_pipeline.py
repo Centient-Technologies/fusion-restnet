@@ -1,6 +1,6 @@
 """
-Fusion-ResNet Inference Pipeline for NILM Deployment
-=====================================================
+Fusion-ResNet Inference Pipeline for NILM
+=========================================
 
 Inference on pre-processed features from the ESP32 hardware module.
 The ESP32 handles all preprocessing (FITPS, windowing, normalization, ICA, FFT, Fryze).
@@ -37,15 +37,17 @@ import json
 import time
 import warnings
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn.functional as F
-from sklearn.decomposition import FastICA
 
-from fusion_resnet import FusionResNet, FusionResNetLite
+from fusion_resnet import (
+    FusionResNet,
+    FusionResNetLite,
+    build_split_model_from_full_checkpoint,
+)
 from anomaly_detector import AnomalyDetector
 
 warnings.filterwarnings('ignore')
@@ -56,6 +58,7 @@ DEFAULT_APPLIANCE_NAMES = [
     'Compact Fluorescent Lamp', 'Fan', 'Fridge', 'Hair Iron',
     'Hairdryer', 'Heater', 'Incandescent Light Bulb', 'Laptop',
     'Microwave', 'Soldering Iron', 'Vacuum', 'Washing Machine',
+    'Water kettle',
 ]
 
 
@@ -92,10 +95,7 @@ def parse_args():
                         help='(Legacy) Input is already segmented into windows (N, 400). '
                              'Use --preprocessed for ESP32 features.')
     parser.add_argument('--data-dir', type=str, default='data',
-                        help='Directory with training data (for ICA fitting)')
-    parser.add_argument('--ica-path', type=str, default=None,
-                        help='Path to saved ICA parameters (.npz). '
-                             'If not provided, ICA is re-fitted from training data.')
+                        help='Directory with training metadata (for label names fallback)')
     parser.add_argument('--top-k', type=int, default=None,
                         help='Only show top-k most confident appliances per window')
     parser.add_argument('--enable-anomaly-detection', action='store_true',
@@ -284,83 +284,42 @@ def load_preprocessed_features(input_path: str) -> tuple[dict[str, np.ndarray], 
 
 
 # ==============================================================================
-# ICA Utilities
-# ==============================================================================
-
-def fit_ica_from_training_data(data_dir: str, n_components: int) -> dict:
-    """Fit ICA on training data (reproduces training pipeline).
-
-    Args:
-        data_dir: Path to directory containing X_real.npy and y_real.npy.
-        n_components: Number of ICA components (must match checkpoint).
-    """
-    print("  Fitting ICA from training data...")
-    X_real = np.load(f'{data_dir}/X_real.npy', allow_pickle=True)
-    y_real = np.load(f'{data_dir}/y_real.npy', allow_pickle=True)
-
-    # Drop rare classes (same as training)
-    _, counts = np.unique(y_real, return_counts=True)
-    to_drop = np.argwhere(counts < 10).ravel()
-    for idx in to_drop:
-        mask = y_real != idx
-        y_real = y_real[mask]
-        X_real = X_real[mask]
-
-    # Normalize
-    X_real = X_real / np.abs(X_real).max(axis=1, keepdims=True)
-
-    # Fit ICA
-    fica = FastICA(n_components, whiten='unit-variance', random_state=42)
-    fica.fit(X_real)
-
-    X_ica = fica.transform(X_real)
-    X_exp = np.exp(X_ica)
-    m = X_exp.mean(axis=0, keepdims=True)
-    s = X_exp.std(axis=0, keepdims=True, ddof=1)
-
-    return {
-        'U': fica.components_.astype(np.float64),
-        'M': fica.mean_.astype(np.float64),
-        'm': m,
-        's': s,
-    }
-
-
-def save_ica_params(ica_params: dict, path: str):
-    """Save ICA parameters to a .npz file."""
-    np.savez(path, **ica_params)
-    print(f"  Saved ICA parameters to {path}")
-
-
-def load_ica_params(path: str) -> dict:
-    """Load ICA parameters from a .npz file."""
-    data = np.load(path)
-    return {k: data[k] for k in data.files}
-
-
-# ==============================================================================
 # Model Loading
 # ==============================================================================
 
-def load_model(checkpoint_path: str, variant: str, n_classes: int,
-               signal_length: int, ica_params: dict, device: str,
+def load_model(checkpoint_path: str, variant: str, device: str,
                dtype: torch.dtype) -> tuple:
     """Load a trained Fusion-ResNet model from checkpoint.
 
     Returns:
         model: Loaded model in eval mode
         threshold: Classification threshold from training
+        checkpoint: Loaded checkpoint dict
     """
+    ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    state_dict = ckpt['model_state_dict']
+
+    classifier_weight_key = [k for k in state_dict
+                             if 'classifier' in k and 'weight' in k][-1]
+    n_classes = state_dict[classifier_weight_key].shape[0]
+    signal_length = int(ckpt.get('signal_length', 400))
+
+    has_ica = 'ica_branch.ica.U' in state_dict
+    model_kwargs = {
+        'n_classes': n_classes,
+        'signal_length': signal_length,
+    }
+    if has_ica:
+        model_kwargs.update({
+            'U': state_dict['ica_branch.ica.U'].cpu().numpy(),
+            'M': state_dict['ica_branch.ica.M'].cpu().numpy(),
+            'm': state_dict['ica_branch.norm.m'].cpu().numpy(),
+            's': state_dict['ica_branch.norm.s'].cpu().numpy(),
+        })
+
     ModelClass = FusionResNet if variant == 'full' else FusionResNetLite
 
-    model = ModelClass(
-        n_classes=n_classes,
-        signal_length=signal_length,
-        U=ica_params['U'],
-        M=ica_params['M'],
-        m=ica_params['m'],
-        s=ica_params['s'],
-    )
+    model = ModelClass(**model_kwargs)
 
     if dtype == torch.float64:
         model = model.double()
@@ -369,8 +328,6 @@ def load_model(checkpoint_path: str, variant: str, n_classes: int,
 
     model = model.to(device)
 
-    # Load checkpoint
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=True)
     model.load_state_dict(ckpt['model_state_dict'])
     threshold = ckpt.get('threshold', 0.5)
     epoch = ckpt.get('epoch', '?')
@@ -379,7 +336,21 @@ def load_model(checkpoint_path: str, variant: str, n_classes: int,
     print(f"  Loaded checkpoint: epoch {epoch}, val F1 = {best_f1}")
 
     model.eval()
-    return model, threshold
+    return model, threshold, ckpt
+
+
+def load_split_model(checkpoint_path: str, device: str,
+                     dtype: torch.dtype) -> tuple:
+    """Load the hardware-aligned split-head model from a full checkpoint."""
+    ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=True)
+    model, ica_params = build_split_model_from_full_checkpoint(
+        ckpt, dtype=dtype, device=device)
+    threshold = ckpt.get('threshold', 0.5)
+    epoch = ckpt.get('epoch', '?')
+    best_f1 = ckpt.get('best_val_f1', 'N/A')
+
+    print(f"  Loaded split checkpoint: epoch {epoch}, val F1 = {best_f1}")
+    return model, threshold, ckpt, ica_params
 
 
 # ==============================================================================
@@ -442,47 +413,16 @@ def run_inference_preprocessed(model, feature_tensors: tuple,
     n_samples = raw_window.shape[0]
     all_probs = []
 
-    # Create a wrapper that handles pre-processed features
-    # The model's branches expect the full preprocessing pipeline,
-    # so we shortcut by sending features directly to each branch
     with torch.no_grad():
         for i in range(0, n_samples, batch_size):
             end_idx = min(i + batch_size, n_samples)
-            
-            # Extract batch
             raw_batch = raw_window[i:end_idx]
             fft_batch = fft_magnitude[i:end_idx]
             fryze_a_batch = fryze_active[i:end_idx]
             fryze_r_batch = fryze_reactive[i:end_idx]
             ica_batch = ica_features[i:end_idx]
-
-            # Branch 1: Raw signal (already normalized)
-            raw_feat = model.raw_branch(raw_batch)
-
-            # Branch 2: ICA (features already computed)
-            ica_expanded = ica_batch.unsqueeze(1)  # (B, 1, 16)
-            ica_feat = model.ica_branch.stem(ica_expanded)
-            ica_feat = model.ica_branch.stages(ica_feat)
-            ica_feat = model.ica_branch.pool(ica_feat).squeeze(-1)
-
-            # Branch 3: Fryze (features already decomposed)
-            fryze_stack = torch.stack([fryze_r_batch, fryze_a_batch], dim=1)  # (B, 2, 50)
-            fryze_feat = model.fryze_branch.stem(fryze_stack)
-            fryze_feat = model.fryze_branch.stages(fryze_feat)
-            fryze_feat = model.fryze_branch.pool(fryze_feat).squeeze(-1)
-
-            # Branch 4: FFT (pre-computed magnitude)
-            fft_expanded = fft_batch.unsqueeze(1)  # (B, 1, 200)
-            fft_feat = model.fft_branch.stem(fft_expanded)
-            fft_feat = model.fft_branch.stages(fft_feat)
-            fft_feat = model.fft_branch.pool(fft_feat).squeeze(-1)
-
-            # Fuse branches
-            feats = [raw_feat, ica_feat, fryze_feat, fft_feat]
-            fused = model.fusion(feats)
-
-            # Classify
-            logits = model.classifier(fused)
+            logits = model(
+                raw_batch, fft_batch, fryze_a_batch, fryze_r_batch, ica_batch)
             probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.append(probs)
 
@@ -604,7 +544,8 @@ def format_results(predictions: np.ndarray, probabilities: np.ndarray,
 
         if timestamps is not None:
             entry['time_start_s'] = float(timestamps[i])
-            window_time = datetime.fromtimestamp(timestamps[i])
+            window_time = datetime.fromtimestamp(timestamps[i], tz=timezone.utc)
+            entry['timestamp'] = window_time.isoformat()
         else:
             window_time = None
 
@@ -745,7 +686,7 @@ def create_mobile_payload(results: list[dict], appliance_names: list[str],
     # Create mobile payload
     payload = {
         'metadata': {
-            'timestamp': datetime.utcnow().isoformat() + 'Z',
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'model_version': model_version,
             'variant': 'preprocessed',  # Input is pre-processed features
             'n_windows': n_windows,
@@ -864,26 +805,26 @@ def main():
     # ------------------------------------------------------------------
     # 2. Load appliance names (filter to match checkpoint n_classes)
     # ------------------------------------------------------------------
-    appliance_names = DEFAULT_APPLIANCE_NAMES
-    lenc_path = os.path.join(args.data_dir, 'real_label_encoder.npy')
-    if os.path.exists(lenc_path):
-        try:
-            lenc = np.load(lenc_path, allow_pickle=True).item()
-            all_names = list(lenc.classes_)
-            if len(all_names) != n_classes:
-                # The training script drops classes with <10 samples.
-                # Reproduce the same filtering to get the correct name list.
-                y_real = np.load(os.path.join(args.data_dir, 'y_real.npy'),
-                                 allow_pickle=True)
-                _, counts = np.unique(y_real, return_counts=True)
-                kept = [i for i, c in enumerate(counts) if c >= 10]
-                appliance_names = [all_names[i] for i in kept]
-                print(f"  Filtered to {len(appliance_names)} appliance names "
-                      f"(dropped {len(all_names) - len(appliance_names)} rare classes)")
-            else:
-                appliance_names = all_names
-        except Exception:
-            pass
+    appliance_names = [str(name) for name in ckpt.get('appliance_names', [])]
+    if not appliance_names:
+        lenc_path = os.path.join(args.data_dir, 'real_label_encoder.npy')
+        if os.path.exists(lenc_path):
+            try:
+                lenc = np.load(lenc_path, allow_pickle=True).item()
+                all_names = list(lenc.classes_)
+                kept_class_ids = ckpt.get('kept_class_ids')
+                if kept_class_ids:
+                    appliance_names = [str(all_names[idx]) for idx in kept_class_ids]
+                elif len(all_names) != n_classes:
+                    y_real = np.load(os.path.join(args.data_dir, 'y_real.npy'),
+                                     allow_pickle=True)
+                    class_ids, counts = np.unique(y_real, return_counts=True)
+                    kept = [int(cls) for cls, count in zip(class_ids, counts) if count >= 10]
+                    appliance_names = [str(all_names[idx]) for idx in kept]
+                else:
+                    appliance_names = [str(name) for name in all_names]
+            except Exception:
+                pass
 
     # Final safety check
     if len(appliance_names) != n_classes:
@@ -892,45 +833,23 @@ def main():
         appliance_names = [f'Appliance_{i}' for i in range(n_classes)]
 
     # ------------------------------------------------------------------
-    # 3. Load/Fit ICA parameters (with correct n_components from checkpoint)
+    # 3. Load model
     # ------------------------------------------------------------------
-    ica_params = None
-    if not args.preprocessed:
-        print("\n[2/5] Preparing ICA parameters...")
-        if args.ica_path and os.path.exists(args.ica_path):
-            ica_params = load_ica_params(args.ica_path)
-            # Validate dimensions match checkpoint
-            if ica_params['U'].shape[0] != n_ica_components:
-                print(f"  Warning: saved ICA has {ica_params['U'].shape[0]} components "
-                      f"but checkpoint expects {n_ica_components}. Re-fitting...")
-                ica_params = fit_ica_from_training_data(args.data_dir, n_ica_components)
-                ica_save_path = os.path.join(args.data_dir, 'ica_params.npz')
-                save_ica_params(ica_params, ica_save_path)
-            else:
-                print(f"  Loaded ICA from: {args.ica_path}")
-        else:
-            ica_params = fit_ica_from_training_data(args.data_dir, n_ica_components)
-            # Auto-save for future use
-            ica_save_path = os.path.join(args.data_dir, 'ica_params.npz')
-            save_ica_params(ica_params, ica_save_path)
+    print("\n[2/5] Loading model...")
+    if args.preprocessed:
+        model, ckpt_threshold, ckpt, _ = load_split_model(
+            args.checkpoint, args.device, dtype)
     else:
-        print("\n[2/5] Skipping ICA (input is pre-processed)")
-
-    # ------------------------------------------------------------------
-    # 4. Load model
-    # ------------------------------------------------------------------
-    print("\n[3/5] Loading model...")
-    model, ckpt_threshold = load_model(
-        args.checkpoint, args.variant, n_classes, args.window_size,
-        ica_params, args.device, dtype)
+        model, ckpt_threshold, ckpt = load_model(
+            args.checkpoint, args.variant, args.device, dtype)
 
     threshold = args.threshold if args.threshold is not None else ckpt_threshold
     print(f"  Using threshold: {threshold:.2f}")
 
     # ------------------------------------------------------------------
-    # 5. Load and preprocess input
+    # 4. Load and preprocess input
     # ------------------------------------------------------------------
-    print("\n[4/5] Loading input...")
+    print("\n[3/5] Loading input...")
     
     if args.preprocessed:
         # Load pre-processed features from ESP32
@@ -956,14 +875,11 @@ def main():
         feature_tensors = None
 
     # ------------------------------------------------------------------
-    # 6. Run inference
-    # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
-    # 5b. Initialize anomaly detection (optional)
+    # 5. Initialize anomaly detection (optional)
     # ------------------------------------------------------------------
     anomaly_detector = None
     if args.enable_anomaly_detection:
-        print("\n[5b/5] Initializing anomaly detection...")
+        print("\n[4/5] Initializing anomaly detection...")
         history_path = args.anomaly_history or os.path.join(args.output, '.anomaly_history.json')
         anomaly_detector = AnomalyDetector(appliance_names, history_file=history_path)
         print(f"  Anomaly detector ready")
