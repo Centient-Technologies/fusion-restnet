@@ -105,6 +105,12 @@ def parse_args():
                         help='Checkpoint save directory')
     parser.add_argument('--n-samples', type=int, default=2000,
                         help='Samples per component for mixture generation')
+    parser.add_argument('--resume-from', type=str, default=None,
+                        help='Resume training from a checkpoint path')
+    parser.add_argument('--save-every', type=int, default=1,
+                        help='Save last.pt every N epochs (default: 1)')
+    parser.add_argument('--snapshot-every', type=int, default=25,
+                        help='Also save epoch snapshots every N epochs (default: 25, 0 disables)')
     return parser.parse_args()
 
 
@@ -335,20 +341,22 @@ def val_epoch(model, loader, loss_fn, device, dtype):
 
 
 def train_model(model, train_loader, val_loader, loss_fn, optimizer, scheduler,
-                num_epochs, device, dtype, save_dir='', checkpoint_meta=None):
-    history = {
-        "train": {"loss": [], "score": []},
-        "val": {"loss": [], "score": []},
-        "threshold": [], "lr": [],
-    }
+                num_epochs, device, dtype, save_dir='', checkpoint_meta=None,
+                start_epoch=0, best_val=0.0, history=None, save_every=1,
+                snapshot_every=25):
+    if history is None:
+        history = {
+            "train": {"loss": [], "score": []},
+            "val": {"loss": [], "score": []},
+            "threshold": [], "lr": [],
+        }
 
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
 
-    best_val = 0.0
     val_stats = {}
 
-    for epoch in range(num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         t0 = time.time()
 
         train_stats = train_epoch(
@@ -376,26 +384,39 @@ def train_model(model, train_loader, val_loader, loss_fn, optimizer, scheduler,
                   f"Val Loss: {val_stats['val/loss']:.4f} F1: {val_stats['val/score']:.4f} | "
                   f"LR: {optimizer.param_groups[0]['lr']:.2e} | {elapsed:.1f}s")
 
+        ckpt = {
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+            "best_val_f1": best_val,
+            "threshold": val_stats.get('threshold', 0.5),
+            "history": history,
+        }
+        if checkpoint_meta:
+            ckpt.update(checkpoint_meta)
+
         if val_stats['val/score'] > best_val:
             best_val = val_stats['val/score']
+            ckpt["best_val_f1"] = best_val
             if save_dir:
-                ckpt = {
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "best_val_f1": best_val,
-                    "threshold": val_stats['threshold'],
-                }
-                if checkpoint_meta:
-                    ckpt.update(checkpoint_meta)
                 torch.save(ckpt, f"{save_dir}/best.pt")
+
+        if save_dir and save_every > 0 and ((epoch + 1) % save_every == 0):
+            torch.save(ckpt, f"{save_dir}/last.pt")
+
+        if save_dir and snapshot_every > 0 and ((epoch + 1) % snapshot_every == 0):
+            torch.save(ckpt, f"{save_dir}/epoch_{epoch + 1:03d}.pt")
 
     if save_dir:
         ckpt = {
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
+            "best_val_f1": best_val,
             "threshold": val_stats.get('threshold', 0.5),
+            "history": history,
         }
         if checkpoint_meta:
             ckpt.update(checkpoint_meta)
@@ -921,6 +942,21 @@ def main():
     scheduler = ReduceLROnPlateau(optimizer, 'min', factor=0.8, patience=15, min_lr=1e-7)
     loss_fn = nn.BCEWithLogitsLoss()
 
+    start_epoch = 0
+    best_val = 0.0
+    history = None
+    if args.resume_from:
+        print(f"  Resuming from: {args.resume_from}")
+        resume_ckpt = torch.load(args.resume_from, map_location=args.device, weights_only=True)
+        model.load_state_dict(resume_ckpt['model_state_dict'])
+        optimizer.load_state_dict(resume_ckpt['optimizer_state_dict'])
+        if scheduler and resume_ckpt.get('scheduler_state_dict') is not None:
+            scheduler.load_state_dict(resume_ckpt['scheduler_state_dict'])
+        start_epoch = int(resume_ckpt.get('epoch', -1)) + 1
+        best_val = float(resume_ckpt.get('best_val_f1', 0.0))
+        history = resume_ckpt.get('history')
+        print(f"  Resume epoch: {start_epoch} | Best val F1 so far: {best_val:.4f}")
+
     history = train_model(
         model, train_loader, val_loader, loss_fn, optimizer, scheduler,
         num_epochs=args.epochs, device=args.device, dtype=dtype,
@@ -933,6 +969,11 @@ def main():
             "n_classes": n_classes,
             "model_version": args.model_version,
         },
+        start_epoch=start_epoch,
+        best_val=best_val,
+        history=history,
+        save_every=args.save_every,
+        snapshot_every=args.snapshot_every,
     )
 
     # ------------------------------------------------------------------

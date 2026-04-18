@@ -18,13 +18,21 @@ from sklearn.metrics import confusion_matrix, accuracy_score
 
 
 import os, json
+import importlib.util
+from pathlib import Path
 from tqdm import tqdm
 
 
 # In[3]:
 
 
-from transforms import FITPS
+_transforms_path = Path(__file__).resolve().parent / "transforms.py"
+_spec = importlib.util.spec_from_file_location("transforms", _transforms_path)
+if _spec is None or _spec.loader is None:
+    raise ImportError(f"Could not load transforms module from {_transforms_path}")
+_transforms = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_transforms)
+FITPS = _transforms.FITPS
 
 
 # In[5]:
