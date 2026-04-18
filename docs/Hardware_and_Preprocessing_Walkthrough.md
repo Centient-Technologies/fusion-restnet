@@ -179,7 +179,6 @@ Clean single-appliance windows
 
 This step only happens during training. During inference on real household data, the signal coming from the main power line is already a natural mixture of all active appliances.
 
-**Note:** This model has been updated for Ghana power standard (50Hz). The original model was trained on 60Hz data (PLAID dataset). Retraining on 50Hz Ghana-sourced data is required for optimal performance. See FREQUENCY_CHANGE_ANALYSIS.md for details.
 
 ### Stage 6: Normalization
 
