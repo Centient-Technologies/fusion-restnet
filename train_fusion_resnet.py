@@ -103,6 +103,8 @@ def parse_args():
     parser.add_argument('--data-dir', type=str, default='data', help='Data directory')
     parser.add_argument('--save-dir', type=str, default='checkpoints/fusion_resnet',
                         help='Checkpoint save directory')
+    parser.add_argument('--figures-dir', type=str, default='figures',
+                        help='Directory to save plots and test metrics')
     parser.add_argument('--n-samples', type=int, default=2000,
                         help='Samples per component for mixture generation')
     parser.add_argument('--resume-from', type=str, default=None,
@@ -111,6 +113,10 @@ def parse_args():
                         help='Save last.pt every N epochs (default: 1)')
     parser.add_argument('--snapshot-every', type=int, default=25,
                         help='Also save epoch snapshots every N epochs (default: 25, 0 disables)')
+    parser.add_argument('--early-stopping-patience', type=int, default=0,
+                        help='Stop if validation F1 does not improve for N epochs (0 disables)')
+    parser.add_argument('--early-stopping-min-delta', type=float, default=0.0,
+                        help='Minimum validation F1 improvement to reset early stopping')
     return parser.parse_args()
 
 
@@ -343,7 +349,8 @@ def val_epoch(model, loader, loss_fn, device, dtype):
 def train_model(model, train_loader, val_loader, loss_fn, optimizer, scheduler,
                 num_epochs, device, dtype, save_dir='', checkpoint_meta=None,
                 start_epoch=0, best_val=0.0, history=None, save_every=1,
-                snapshot_every=25):
+                snapshot_every=25, early_stopping_patience=0,
+                early_stopping_min_delta=0.0):
     if history is None:
         history = {
             "train": {"loss": [], "score": []},
@@ -355,6 +362,11 @@ def train_model(model, train_loader, val_loader, loss_fn, optimizer, scheduler,
         os.makedirs(save_dir, exist_ok=True)
 
     val_stats = {}
+    epochs_without_improvement = 0
+    stop_epoch = None
+    model_version = checkpoint_meta.get('model_version', '0.0.1-dev') if checkpoint_meta else '0.0.1-dev'
+    best_versioned_path = os.path.join(save_dir, f"latest_v{model_version}.pt")
+    last_versioned_path = os.path.join(save_dir, f"last_v{model_version}.pt")
 
     for epoch in range(start_epoch, num_epochs):
         t0 = time.time()
@@ -396,31 +408,46 @@ def train_model(model, train_loader, val_loader, loss_fn, optimizer, scheduler,
         if checkpoint_meta:
             ckpt.update(checkpoint_meta)
 
-        if val_stats['val/score'] > best_val:
+        improved = val_stats['val/score'] > (best_val + early_stopping_min_delta)
+        if improved:
             best_val = val_stats['val/score']
             ckpt["best_val_f1"] = best_val
+            epochs_without_improvement = 0
             if save_dir:
-                torch.save(ckpt, f"{save_dir}/latest-v0.0.1-dev.pt")
+                torch.save(ckpt, f"{save_dir}/best.pt")
+                torch.save(ckpt, best_versioned_path)
+        else:
+            epochs_without_improvement += 1
 
         if save_dir and save_every > 0 and ((epoch + 1) % save_every == 0):
             torch.save(ckpt, f"{save_dir}/last.pt")
+            torch.save(ckpt, last_versioned_path)
 
         if save_dir and snapshot_every > 0 and ((epoch + 1) % snapshot_every == 0):
             torch.save(ckpt, f"{save_dir}/epoch_{epoch + 1:03d}.pt")
 
+        if early_stopping_patience > 0 and epochs_without_improvement >= early_stopping_patience:
+            stop_epoch = epoch
+            print(f"Early stopping at epoch {epoch} | "
+                  f"Best val F1: {best_val:.4f} | "
+                  f"No improvement for {epochs_without_improvement} epochs")
+            break
+
     if save_dir:
         ckpt = {
-            "epoch": epoch,
+            "epoch": stop_epoch if stop_epoch is not None else epoch,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
             "best_val_f1": best_val,
             "threshold": val_stats.get('threshold', 0.5),
             "history": history,
+            "early_stopped": stop_epoch is not None,
         }
         if checkpoint_meta:
             ckpt.update(checkpoint_meta)
-        torch.save(ckpt, f"{save_dir}/last-v0.0.1-dev.pt")
+        torch.save(ckpt, f"{save_dir}/last.pt")
+        torch.save(ckpt, last_versioned_path)
 
     print(f"\nBest validation F1: {best_val:.4f}")
     return history
@@ -974,6 +1001,8 @@ def main():
         history=history,
         save_every=args.save_every,
         snapshot_every=args.snapshot_every,
+        early_stopping_patience=args.early_stopping_patience,
+        early_stopping_min_delta=args.early_stopping_min_delta,
     )
 
     # ------------------------------------------------------------------
@@ -1008,7 +1037,7 @@ def main():
     )
 
     # Save metrics to JSON
-    os.makedirs('figures', exist_ok=True)
+    os.makedirs(args.figures_dir, exist_ok=True)
     import json
     metrics_serializable = {k: v for k, v in metrics.items() if k != 'per_class'}
     metrics_serializable['per_class'] = {
@@ -1019,12 +1048,14 @@ def main():
         str(k): {mk: float(mv) for mk, mv in v.items()}
         for k, v in metrics.get('per_n_components', {}).items()
     }
-    with open('figures/test_metrics.json', 'w') as f:
+    with open(os.path.join(args.figures_dir, 'test_metrics.json'), 'w') as f:
         json.dump(metrics_serializable, f, indent=2)
-    print("  Saved: figures/test_metrics.json")
+    with open(os.path.join(args.figures_dir, f'test_metrics_{args.model_version}.json'), 'w') as f:
+        json.dump(metrics_serializable, f, indent=2)
+    print(f"  Saved: {args.figures_dir}/test_metrics.json")
 
     # Generate all plots
-    generate_all_plots(history, metrics, save_dir='figures')
+    generate_all_plots(history, metrics, save_dir=args.figures_dir)
 
     print("Done!")
 
